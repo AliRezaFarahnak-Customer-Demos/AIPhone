@@ -1,0 +1,2 @@
+Look up the latest exceptions and events and clarify what I am missing, we are trying to get it to work with Avaya protocol and incomingCall handling.
+Only query events within last 30 minutes, dont assume that issues are the same because of previous issues really analyze them as new fresh events
