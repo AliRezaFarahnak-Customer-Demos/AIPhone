@@ -1,7 +1,4 @@
-# Docs for the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# More GitHub Actions for Azure: https://github.com/Azure/actions
-
-name: Build and deploy ASP.Net Core app to Azure Web App - ai-phone
+name: Build and deploy to Azure Container Apps
 
 on:
   push:
@@ -9,45 +6,18 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
-  build:
-    runs-on: windows-latest
+  build-and-deploy:
+    runs-on: ubuntu-latest
     permissions:
-      contents: read #This is required for actions/checkout
+      id-token: write
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up .NET Core
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.x"
-
-      - name: Build with dotnet
-        run: dotnet build api/AIPhone.csproj --configuration Release
-
-      - name: dotnet publish
-        run: dotnet publish api/AIPhone.csproj -c Release -o "${{env.DOTNET_ROOT}}/myapp"
-
-      - name: Upload artifact for deployment job
-        uses: actions/upload-artifact@v4
-        with:
-          name: .net-app
-          path: ${{env.DOTNET_ROOT}}/myapp
-
-  deploy:
-    runs-on: windows-latest
-    needs: build
-    permissions:
-      id-token: write #This is required for requesting the JWT
-      contents: read #This is required for actions/checkout
-
-    steps:
-      - name: Download artifact from build job
-        uses: actions/download-artifact@v4
-        with:
-          name: .net-app
-          path: ./myapp
 
       - name: Login to Azure
         uses: azure/login@v2
@@ -56,24 +26,11 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9DAE1FE2422446CD9D7E5257C6538C53 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_874ACE108B994B318B0A24DA79767AB7 }}
 
-      - name: Deploy to Azure Web App
-        id: deploy-to-webapp
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: "ai-phone"
-          slot-name: "Production"
-          package: ./myapp
-
-      - name: Configure App Settings
-        uses: azure/appservice-settings@v1
-        with:
-          app-name: "ai-phone"
-          slot-name: "Production"
-          app-settings-json: |
-            [
-              { "name": "ApplicationInsights__ConnectionString", "value": "${{ secrets.APPINSIGHTS_CONNECTION_STRING }}", "slotSetting": false },
-              { "name": "AcsConnectionString", "value": "${{ secrets.ACS_CONNECTION_STRING }}", "slotSetting": false },
-              { "name": "AzureVoiceLiveApiKey", "value": "${{ secrets.AZURE_VOICE_LIVE_API_KEY }}", "slotSetting": false },
-              { "name": "AzureVoiceLiveEndpoint", "value": "${{ secrets.AZURE_VOICE_LIVE_ENDPOINT }}", "slotSetting": false },
-              { "name": "VoiceLiveModel", "value": "${{ secrets.VOICE_LIVE_MODEL }}", "slotSetting": false }
-            ]
+      - name: Build and deploy to Container App
+        run: |
+          az containerapp up \
+            --name ca-caller-agent \
+            --resource-group rg-myagents \
+            --environment cae-myagents \
+            --registry-server crmyagents.azurecr.io \
+            --source api/
