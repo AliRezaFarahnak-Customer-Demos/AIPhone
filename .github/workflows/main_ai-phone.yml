@@ -26,11 +26,17 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9DAE1FE2422446CD9D7E5257C6538C53 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_874ACE108B994B318B0A24DA79767AB7 }}
 
-      - name: Build and deploy to Container App
+      - name: Build image in ACR
         run: |
-          az containerapp up \
+          az acr build \
+            --registry crmyagents \
+            --image caller-agent:${{ github.sha }} \
+            --file api/Dockerfile \
+            api/
+
+      - name: Deploy to Container App
+        run: |
+          az containerapp update \
             --name ca-caller-agent \
             --resource-group rg-myagents \
-            --environment cae-myagents \
-            --registry-server crmyagents.azurecr.io \
-            --source api/
+            --image crmyagents.azurecr.io/caller-agent:${{ github.sha }}
