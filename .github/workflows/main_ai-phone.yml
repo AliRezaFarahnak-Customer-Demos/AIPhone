@@ -22,9 +22,13 @@ jobs:
       - name: Login to Azure
         uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_AA5E5586DDDB4831A6CC12A1B835DE49 }}
-          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9DAE1FE2422446CD9D7E5257C6538C53 }}
-          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_874ACE108B994B318B0A24DA79767AB7 }}
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_AA5E5586DDDB4831A6CC12A1B835DE49
+            }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_9DAE1FE2422446CD9D7E5257C6538C53
+            }}
+          subscription-id: ${{
+            secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_874ACE108B994B318B0A24DA79767AB7
+            }}
 
       - name: Build image in ACR
         run: |
@@ -39,4 +43,10 @@ jobs:
           az containerapp update \
             --name ca-caller-agent \
             --resource-group rg-myagents \
-            --image crmyagents.azurecr.io/caller-agent:${{ github.sha }}
+            --image crmyagents.azurecr.io/caller-agent:${{ github.sha }} \
+            --set-env-vars \
+              BUILD_NUMBER=${{ github.run_number }} \
+              BUILD_SHA=${{ github.sha }} \
+              BUILD_REF=${{ github.ref_name }} \
+              BUILD_RUN_URL=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} \
+              BUILD_TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)

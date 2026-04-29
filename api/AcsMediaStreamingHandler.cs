@@ -11,19 +11,29 @@ namespace CallAutomation.AzureAI.VoiceLive
         private readonly IConfiguration m_configuration;
         private readonly ILogger<AcsMediaStreamingHandler> m_logger;
         private readonly ILoggerFactory m_loggerFactory;
+        private readonly Azure.Core.TokenCredential m_aiCredential;
         private AzureVoiceLiveService m_aiServiceHandler = null!;
         private CancellationTokenSource m_cts = new();
+        private Func<string, Task>? m_onHangUp;
+
+        /// <summary>
+        /// Register a callback invoked when the AI decides to hang up the call.
+        /// Forwarded to AzureVoiceLiveService once it's constructed in ProcessWebSocketAsync.
+        /// </summary>
+        public void OnHangUp(Func<string, Task> callback) => m_onHangUp = callback;
 
         public AcsMediaStreamingHandler(
             WebSocket webSocket,
             IConfiguration configuration,
             ILogger<AcsMediaStreamingHandler> logger,
-            ILoggerFactory loggerFactory)
+            ILoggerFactory loggerFactory,
+            Azure.Core.TokenCredential aiCredential)
         {
             m_webSocket = webSocket;
             m_configuration = configuration;
             m_logger = logger;
             m_loggerFactory = loggerFactory;
+            m_aiCredential = aiCredential;
         }
 
         public async Task ProcessWebSocketAsync()
@@ -35,20 +45,17 @@ namespace CallAutomation.AzureAI.VoiceLive
                 m_aiServiceHandler = new AzureVoiceLiveService(
                     this,
                     m_configuration,
-                    m_loggerFactory.CreateLogger<AzureVoiceLiveService>());
-
-                // hang_up tool callback — terminate the bridge so ACS tears down the call.
-                m_aiServiceHandler.OnHangUp(async reason =>
-                {
-                    m_logger.LogInformation("AI requested hang up: {Reason}", reason);
-                    m_cts.Cancel();
-                    if (m_webSocket.State == WebSocketState.Open)
-                    {
-                        await m_webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "AI hangup", CancellationToken.None);
-                    }
-                });
+                    m_loggerFactory.CreateLogger<AzureVoiceLiveService>(),
+                    m_aiCredential);
 
                 await m_aiServiceHandler.InitializeAsync();
+
+                // Forward the externally-registered hang-up callback to the AI service
+                if (m_onHangUp != null)
+                {
+                    m_aiServiceHandler.OnHangUp(m_onHangUp);
+                }
+
                 await StartReceivingFromAcsMediaWebSocket();
             }
             catch (Exception ex)

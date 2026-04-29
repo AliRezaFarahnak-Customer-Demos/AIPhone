@@ -1,4 +1,5 @@
 using Azure.Communication.CallAutomation;
+using Azure.Identity;
 using Azure.Messaging;
 using Azure.Messaging.EventGrid;
 using Azure.Messaging.EventGrid.SystemEvents;
@@ -7,6 +8,7 @@ using Microsoft.ApplicationInsights;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.AspNetCore.Mvc;
 using Newtonsoft.Json;
+using System.Collections.Concurrent;
 using System.ComponentModel.DataAnnotations;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -14,18 +16,56 @@ var builder = WebApplication.CreateBuilder(args);
 // Add local settings for development (file is in .gitignore)
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 
-// Add Application Insights telemetry
-builder.Services.AddApplicationInsightsTelemetry(options =>
-{
-    options.ConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
-});
+// App Insights — SDK auto-detects APPLICATIONINSIGHTS_CONNECTION_STRING env var (set by Bicep/Container App)
+builder.Services.AddApplicationInsightsTelemetry();
 
-//Get ACS Connection String from appsettings.json
+// Get ACS Connection String from config
 var acsConnectionString = builder.Configuration.GetValue<string>("AcsConnectionString");
 ArgumentNullException.ThrowIfNullOrEmpty(acsConnectionString);
 
-//Call Automation Client
+// Call Automation Client
 var client = new CallAutomationClient(acsConnectionString);
+
+// Credential singleton for Azure Voice Live (managed identity in Azure, az-cli locally)
+var aiCredential = new DefaultAzureCredential();
+
+// Pre-warm the AI token AND validate Voice Live WebSocket connectivity at startup.
+// Catches RBAC/auth issues immediately instead of silently failing on the first call.
+try
+{
+    var warmupStart = DateTime.UtcNow;
+    var tokenResult = await aiCredential.GetTokenAsync(
+        new Azure.Core.TokenRequestContext(new[] { "https://cognitiveservices.azure.com/.default" }),
+        CancellationToken.None);
+    var warmupMs = (DateTime.UtcNow - warmupStart).TotalMilliseconds;
+    Console.WriteLine($"✓ AI credential pre-warmed in {warmupMs:F0}ms (expires {tokenResult.ExpiresOn:HH:mm:ss})");
+
+    var voiceLiveEndpoint = builder.Configuration.GetValue<string>("AzureOpenAI:Endpoint");
+    var voiceLiveModel = builder.Configuration.GetValue<string>("AzureOpenAI:DeploymentName") ?? "gpt-realtime";
+    if (!string.IsNullOrEmpty(voiceLiveEndpoint))
+    {
+        var wsUrl = new Uri($"{voiceLiveEndpoint.TrimEnd('/').Replace("https", "wss")}/voice-live/realtime?api-version=2025-10-01&x-ms-client-request-id={Guid.NewGuid()}&model={voiceLiveModel}");
+        using var probeWs = new System.Net.WebSockets.ClientWebSocket();
+        probeWs.Options.SetRequestHeader("Authorization", $"Bearer {tokenResult.Token}");
+        using var probeCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await probeWs.ConnectAsync(wsUrl, probeCts.Token);
+        await probeWs.CloseAsync(System.Net.WebSockets.WebSocketCloseStatus.NormalClosure, "startup probe", CancellationToken.None);
+        Console.WriteLine($"✓ Voice Live WebSocket probe OK (model: {voiceLiveModel})");
+    }
+}
+catch (System.Net.WebSockets.WebSocketException ex) when (ex.Message.Contains("401"))
+{
+    Console.WriteLine($"✗ FATAL: Voice Live WebSocket returned 401 — RBAC roles missing on managed identity!");
+    Console.WriteLine($"  Need 'Cognitive Services OpenAI User' AND 'Cognitive Services User' roles.");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"⚠ AI credential/Voice Live pre-warm failed (will retry on first call): {ex.Message}");
+}
+
+// Track active call connection IDs (keyed by WebSocket contextId) so the hang-up callback can disconnect the call
+var callConnections = new ConcurrentDictionary<string, string>();
+
 var app = builder.Build();
 
 // Get app base URL from multiple sources (priority order)
@@ -34,6 +74,16 @@ var appBaseUrl = Environment.GetEnvironmentVariable("VS_TUNNEL_URL")?.TrimEnd('/
 if (string.IsNullOrEmpty(appBaseUrl))
 {
     appBaseUrl = builder.Configuration.GetValue<string>("AppBaseUrl");
+}
+
+if (string.IsNullOrEmpty(appBaseUrl))
+{
+    // Container Apps sets CONTAINER_APP_HOSTNAME (e.g. ca-caller-agent.<env>.azurecontainerapps.io)
+    var containerAppHostname = Environment.GetEnvironmentVariable("CONTAINER_APP_HOSTNAME");
+    if (!string.IsNullOrEmpty(containerAppHostname))
+    {
+        appBaseUrl = $"https://{containerAppHostname}";
+    }
 }
 
 if (string.IsNullOrEmpty(appBaseUrl))
@@ -52,7 +102,10 @@ if (string.IsNullOrEmpty(appBaseUrl))
 
 Console.WriteLine($"✓ App Base URL: {appBaseUrl}");
 
-app.MapGet("/", () => "Hello ACS CallAutomation!");
+// Build number — populated by GitHub Actions deploy step. Falls back to "local" for dev.
+var buildNumber = Environment.GetEnvironmentVariable("BUILD_NUMBER") ?? "local";
+
+app.MapGet("/", () => $"AI Phone — build {buildNumber}");
 
 app.MapPost("/api/incomingCall", async (
     [FromBody] EventGridEvent[] eventGridEvents,
@@ -82,9 +135,11 @@ app.MapPost("/api/incomingCall", async (
         var incomingCallContext = Helper.GetIncomingCallContext(jsonObject);
         var callerId = Helper.GetCallerId(jsonObject);
 
-        // Build options with MINIMAL processing - no logging, no hashing, no telemetry
-        var callbackUri = new Uri(new Uri(appBaseUrl), $"/api/callbacks/{Guid.NewGuid()}?callerId={callerId}");
-        var websocketUri = appBaseUrl.Replace("https", "wss") + "/ws";
+        // contextId travels through the callback URL AND the WS query string so the
+        // /ws handler can correlate the audio stream back to the call connection.
+        var inboundContextId = Guid.NewGuid().ToString();
+        var callbackUri = new Uri(new Uri(appBaseUrl), $"/api/callbacks/{inboundContextId}?callerId={callerId}");
+        var websocketUri = appBaseUrl.Replace("https", "wss") + $"/ws?contextId={inboundContextId}";
 
         var options = new AnswerCallOptions(incomingCallContext, callbackUri)
         {
@@ -145,13 +200,18 @@ app.MapPost("/api/incomingCall", async (
         // ✅ SUCCESS - Now do all logging/telemetry (call is already connected)
         var answerLatencyMs = (DateTime.UtcNow - answerStartTime).TotalMilliseconds;
         var contextLength = incomingCallContext?.Length ?? 0;
+        var connectionId = answerCallResult.CallConnection.CallConnectionId;
 
-        logger.LogInformation($"[SUCCESS] Call answered in {answerLatencyMs:F0}ms. CallerId={callerId}, ConnectionId={answerCallResult.CallConnection.CallConnectionId}");
+        // Store the connection id so the AI's hang_up tool callback can disconnect the PSTN call
+        callConnections[inboundContextId] = connectionId;
+
+        logger.LogInformation($"[SUCCESS] Call answered in {answerLatencyMs:F0}ms. CallerId={callerId}, ConnectionId={connectionId}, ContextId={inboundContextId}");
 
         telemetryClient.TrackEvent("CallAnsweredSuccess", new Dictionary<string, string>
         {
-            { "CallConnectionId", answerCallResult.CallConnection.CallConnectionId },
+            { "CallConnectionId", connectionId },
             { "CallerId", callerId },
+            { "ContextId", inboundContextId },
             { "ContextLength", contextLength.ToString() },
             { "AnswerLatencyMs", answerLatencyMs.ToString("F0") }
         });
@@ -198,13 +258,42 @@ app.Use(async (context, next) =>
                 var logger = context.RequestServices.GetRequiredService<ILogger<AcsMediaStreamingHandler>>();
                 var loggerFactory = context.RequestServices.GetRequiredService<ILoggerFactory>();
 
+                var wsContextId = context.Request.Query["contextId"].FirstOrDefault();
+
                 var mediaService = new AcsMediaStreamingHandler(
                     webSocket,
                     builder.Configuration,
                     logger,
-                    loggerFactory);
+                    loggerFactory,
+                    aiCredential);
 
-                // Set the single WebSocket connection
+                // Wire the AI's hang_up tool to actually terminate the PSTN call.
+                // ACS opens TWO WebSockets per call — use TryRemove so only one fires the
+                // HangUpAsync; subsequent attempts find no connectionId and noop.
+                if (!string.IsNullOrEmpty(wsContextId))
+                {
+                    mediaService.OnHangUp(async (reason) =>
+                    {
+                        if (callConnections.TryRemove(wsContextId, out var connId))
+                        {
+                            try
+                            {
+                                logger.LogInformation("Hanging up call {ConnectionId}. Reason: {Reason}", connId, reason);
+                                await client.GetCallConnection(connId).HangUpAsync(true);
+                                logger.LogInformation("Call {ConnectionId} disconnected successfully", connId);
+                            }
+                            catch (Exception ex)
+                            {
+                                logger.LogError(ex, "Failed to hang up call {ConnectionId}", connId);
+                            }
+                        }
+                        else
+                        {
+                            logger.LogWarning("No call connection found for context {ContextId} — already disconnected?", wsContextId);
+                        }
+                    });
+                }
+
                 await mediaService.ProcessWebSocketAsync();
             }
             catch (Exception ex)

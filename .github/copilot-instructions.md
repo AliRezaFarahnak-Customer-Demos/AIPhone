@@ -1,5 +1,6 @@
 NEVER UPDATE OTHER FILES - ONLY THIS FILE (.github/copilot-instructions.md)
 NEVER CREATE: documentation, README, scripts
+NEVER BUILD OR DEPLOY LOCALLY (no `dotnet build`, no `az acr build`, no `az containerapp update`) — all builds and deployments happen via the GitHub Actions workflow `.github/workflows/main_ai-phone.yml`. Push to main to trigger.
 Repo: https://github.com/AliRezaFarahnak-Customer-Demos/AIPhone
 
 ## CURRENT STATUS: Stable

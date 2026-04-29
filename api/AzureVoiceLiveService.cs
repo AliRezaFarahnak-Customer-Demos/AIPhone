@@ -8,48 +8,42 @@ namespace CallAutomation.AzureAI.VoiceLive
 {
     /// <summary>
     /// Azure Voice Live Service — bridges ACS media stream to Azure Voice Live API
-    /// via raw WebSocket. Mirrors the production ContactCenterAgent implementation
-    /// 1:1 (azure_semantic_vad, deep noise suppression, server echo cancellation,
-    /// HD voice with style/temperature, greeting protection, hang_up tool with
-    /// farewell sequencing).
+    /// via raw WebSocket. Mirrors ContactCenterAgent 1:1 — managed-identity Bearer auth
+    /// with 401-retry on stale tokens, azure_semantic_vad, deep noise suppression,
+    /// server echo cancellation, HD voice with style/temperature, greeting protection,
+    /// hang_up tool with farewell sequencing.
     ///
-    /// Authentication: api-key header (single shared key from appsettings).
     /// Voice: en-US-Andrew:DragonHDOmniLatestNeural with style="shouting" — Omni
     /// multilingual auto-detect, AI replies in whatever language the caller speaks.
     /// </summary>
     public class AzureVoiceLiveService
     {
-        // ACS media format (24 kHz pcm16 mono — matches MediaStreamingOptions in Program.cs)
-        private const int VoiceLiveBytesPerSecond = 24000 * 2;
+        private const int VoiceLiveBytesPerSecond = 24000 * 2; // 24 kHz pcm16 mono
 
         private readonly CancellationTokenSource m_cts = new();
         private readonly AcsMediaStreamingHandler m_mediaStreaming;
         private readonly IConfiguration m_configuration;
         private readonly ILogger<AzureVoiceLiveService> m_logger;
+        private readonly Azure.Core.TokenCredential m_credential;
 
         private ClientWebSocket m_ws = null!;
         private Func<string, Task>? m_onHangUp;
 
-        // ── Hang-up sequencing state ─────────────────────────────────────────────
-        // The model's tool-call response carries no audio. After receiving it we send
-        // a fresh response.create asking for a spoken farewell, then disconnect after
-        // the farewell audio actually finishes playing on the PSTN side.
+        // Hang-up sequencing
         private bool m_pendingHangUp;
         private string? m_pendingHangUpReason;
         private string? m_hangUpResponseId;
         private long m_farewellAudioBytes;
         private bool m_farewellDisconnectScheduled;
 
-        // ── Greeting protection state ────────────────────────────────────────────
-        // First AI turn is the greeting. Mute barge-in until the greeting actually
-        // finishes playing on the phone, then re-enable normal turn detection.
+        // Greeting protection
         private bool m_greetingInFlight = true;
         private bool m_greetingDelayScheduled;
         private long m_greetingAudioBytesSent;
 
         private static readonly JsonSerializerOptions s_compactJson = new() { WriteIndented = false };
 
-        // System prompt — generic shouting multilingual Andrew (no Norlys branding).
+        // System prompt — generic shouting multilingual Andrew, no branding.
         // First utterance is just "HEJ!" then waits for the caller to respond.
         private const string SystemPrompt =
             @"You are Andrew, a wildly enthusiastic phone agent who SHOUTS EVERYTHING with extreme energy and excitement.
@@ -60,7 +54,7 @@ OPENING (MANDATORY FIRST UTTERANCE):
 
 LANGUAGE RULES:
 - Detect the language of the caller's first response.
-- Reply in that SAME language for the rest of the call. Switch languages instantly if the caller switches language.
+- Reply in that SAME language for the rest of the call. Switch languages instantly if the caller switches.
 - Even if your accent is comically bad in that language — embrace it, lean into it.
 
 PERSONALITY:
@@ -77,29 +71,28 @@ ENDING THE CALL:
         public AzureVoiceLiveService(
             AcsMediaStreamingHandler mediaStreaming,
             IConfiguration configuration,
-            ILogger<AzureVoiceLiveService> logger)
+            ILogger<AzureVoiceLiveService> logger,
+            Azure.Core.TokenCredential credential)
         {
             m_mediaStreaming = mediaStreaming;
             m_configuration = configuration;
             m_logger = logger;
+            m_credential = credential;
             m_logger.LogInformation("AzureVoiceLiveService initialized");
         }
 
         /// <summary>
-        /// Connect, configure session, kick off first response. Must be awaited
-        /// before any audio flows. Separated from constructor to avoid sync-over-async.
+        /// Connect, configure session, kick off first response. Retries once with a
+        /// force-refreshed token on 401 (stale token after deployment restart).
         /// </summary>
         public async Task InitializeAsync()
         {
             try
             {
-                var endpoint = m_configuration.GetValue<string>("AzureVoiceLiveEndpoint");
+                var endpoint = m_configuration.GetValue<string>("AzureOpenAI:Endpoint");
                 ArgumentException.ThrowIfNullOrEmpty(endpoint);
 
-                var apiKey = m_configuration.GetValue<string>("AzureVoiceLiveApiKey");
-                ArgumentException.ThrowIfNullOrEmpty(apiKey);
-
-                var model = m_configuration.GetValue<string>("VoiceLiveModel") ?? "gpt-realtime";
+                var model = m_configuration.GetValue<string>("AzureOpenAI:DeploymentName") ?? "gpt-realtime";
 
                 m_logger.LogInformation("Connecting to Azure Voice Live: {Endpoint}, model: {Model}", endpoint, model);
 
@@ -107,12 +100,38 @@ ENDING THE CALL:
                     $"{endpoint.TrimEnd('/').Replace("https", "wss")}/voice-live/realtime" +
                     $"?api-version=2025-10-01&x-ms-client-request-id={Guid.NewGuid()}&model={model}");
 
-                m_ws = new ClientWebSocket();
-                m_ws.Options.SetRequestHeader("api-key", apiKey);
-                await m_ws.ConnectAsync(url, CancellationToken.None);
-                m_logger.LogInformation("Voice Live WebSocket connected");
+                const int MaxAttempts = 2;
+                for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+                {
+                    var forceRefresh = attempt > 1;
+                    var tokenContext = forceRefresh
+                        ? new Azure.Core.TokenRequestContext(
+                              scopes: new[] { "https://cognitiveservices.azure.com/.default" },
+                              claims: "{}")   // bypass MSAL cache
+                        : new Azure.Core.TokenRequestContext(
+                              new[] { "https://cognitiveservices.azure.com/.default" });
 
-                // Greeting protection: default ON. Set VoiceLive:ProtectFirstResponse=false to disable.
+                    var tokenResult = await m_credential.GetTokenAsync(tokenContext, CancellationToken.None);
+                    m_logger.LogInformation("Token acquired (attempt {Attempt}, forceRefresh: {Force}, expires: {Expiry})",
+                        attempt, forceRefresh, tokenResult.ExpiresOn.ToString("HH:mm:ss"));
+
+                    m_ws = new ClientWebSocket();
+                    m_ws.Options.SetRequestHeader("Authorization", $"Bearer {tokenResult.Token}");
+
+                    try
+                    {
+                        await m_ws.ConnectAsync(url, CancellationToken.None);
+                        m_logger.LogInformation("Voice Live WebSocket connected on attempt {Attempt}", attempt);
+                        break;
+                    }
+                    catch (WebSocketException ex) when (attempt < MaxAttempts && ex.Message.Contains("401"))
+                    {
+                        m_logger.LogWarning("WebSocket got 401 on attempt {Attempt}, retrying with force-refreshed token", attempt);
+                        m_ws.Dispose();
+                        continue;
+                    }
+                }
+
                 m_greetingInFlight = m_configuration.GetValue("VoiceLive:ProtectFirstResponse", true);
                 m_logger.LogInformation("Greeting barge-in protection: {Enabled}", m_greetingInFlight);
 
@@ -131,14 +150,12 @@ ENDING THE CALL:
 
         private async Task UpdateSessionAsync()
         {
-            // VAD knobs — mirrors ContactCenterAgent / danish-voice-lab defaults exactly.
             var vadType = m_configuration.GetValue<string>("VoiceLive:Vad:Type") ?? "azure_semantic_vad";
             var vadThreshold = m_configuration.GetValue("VoiceLive:Vad:Threshold", 0.3);
             var vadPrefixPaddingMs = m_configuration.GetValue("VoiceLive:Vad:PrefixPaddingMs", 300);
             var vadSilenceMs = m_configuration.GetValue("VoiceLive:Vad:SilenceDurationMs", 500);
 
-            m_logger.LogInformation(
-                "VAD config: type={Type}, threshold={Threshold}, prefix={Prefix}ms, silence={Silence}ms",
+            m_logger.LogInformation("VAD: type={Type}, threshold={Threshold}, prefix={Prefix}ms, silence={Silence}ms",
                 vadType, vadThreshold, vadPrefixPaddingMs, vadSilenceMs);
 
             var session = new
@@ -150,9 +167,6 @@ ENDING THE CALL:
                     input_audio_format = "pcm16",
                     output_audio_format = "pcm16",
                     instructions = SystemPrompt,
-                    // During greeting: server won't cancel TTS on user speech, won't auto-fire
-                    // a new response on user speech_stopped. After greeting playback we resend
-                    // session.update with both back to defaults (true).
                     turn_detection = m_greetingInFlight
                         ? (object)new
                         {
@@ -207,11 +221,6 @@ ENDING THE CALL:
             m_logger.LogInformation("session.update sent");
         }
 
-        /// <summary>
-        /// Voice = en-US-Andrew:DragonHDOmniLatestNeural (HD Omni — multilingual auto-detect),
-        /// style = shouting, temperature = 0.9 (max comedic variety). All knobs overridable
-        /// via Voice:* in appsettings.json.
-        /// </summary>
         private Dictionary<string, object> BuildVoiceConfig()
         {
             var voiceType = m_configuration.GetValue<string>("Voice:Type") ?? "azure-standard";
@@ -225,21 +234,17 @@ ENDING THE CALL:
                 ["name"] = voiceName
             };
 
-            // Send temperature + style ONLY for HD / HD Omni voices (name contains ":DragonHD").
-            // Standard neural voices reject/ignore them.
+            // Send temperature + style ONLY for HD / HD Omni voices.
             var isHd = voiceName.Contains(":DragonHD", StringComparison.OrdinalIgnoreCase);
             if (voiceType == "azure-standard" && isHd)
             {
                 voice["temperature"] = voiceTemp;
                 if (!string.IsNullOrWhiteSpace(voiceStyle))
                     voice["style"] = voiceStyle;
-
-                // No locale pinned — Andrew is en-US but Omni multilingual auto-detect
-                // handles whatever language the LLM emits. Pinning a locale would force
-                // a specific accent on every language.
+                // No locale pinned — Andrew Omni multilingual auto-detect.
             }
 
-            m_logger.LogInformation("Voice config: type={Type}, name={Name}, temperature={Temp}, style={Style}",
+            m_logger.LogInformation("Voice: type={Type}, name={Name}, temperature={Temp}, style={Style}",
                 voiceType, voiceName,
                 voice.ContainsKey("temperature") ? voice["temperature"] : "(omitted)",
                 voice.ContainsKey("style") ? voice["style"] : "(omitted)");
@@ -247,21 +252,36 @@ ENDING THE CALL:
             return voice;
         }
 
-        /// <summary>
-        /// Whisper-1 for STT — auto-detects language across ~50 locales, perfect for the
-        /// "AI replies in whatever language you speak" demo. Override via Transcription:Model.
-        /// </summary>
         private Dictionary<string, object> BuildTranscriptionConfig()
         {
-            var model = m_configuration.GetValue<string>("Transcription:Model") ?? "whisper-1";
+            // Default azure-speech (Azure AI Speech real-time STT) — same as CCA.
+            // Override with Transcription:Model only for A/B testing (whisper-1, gpt-4o-transcribe-*).
+            var model = m_configuration.GetValue<string>("Transcription:Model") ?? "azure-speech";
             var lang = m_configuration.GetValue<string>("Transcription:Language");
 
             var config = new Dictionary<string, object> { ["model"] = model };
             if (!string.IsNullOrEmpty(lang))
                 config["language"] = lang;
 
-            m_logger.LogInformation("Transcription config: model={Model}, language={Language}",
-                model, lang ?? "(auto)");
+            var isAzureSpeech = string.Equals(model, "azure-speech", StringComparison.OrdinalIgnoreCase);
+            if (isAzureSpeech)
+            {
+                // Optional vocabulary boost for azure-speech
+                var phrases = m_configuration.GetSection("Transcription:PhraseList").Get<string[]>();
+                if (phrases is { Length: > 0 })
+                    config["phrase_list"] = phrases;
+            }
+            else
+            {
+                // whisper / gpt-4o-transcribe → free-text prompt
+                var prompt = m_configuration.GetValue<string>("Transcription:Prompt");
+                if (!string.IsNullOrEmpty(prompt))
+                    config["prompt"] = prompt;
+            }
+
+            m_logger.LogInformation("Transcription: model={Model}, language={Language}, phrases={Phrases}",
+                model, lang ?? "(auto)",
+                config.TryGetValue("phrase_list", out var pl) ? ((string[])pl).Length : 0);
             return config;
         }
 
@@ -314,9 +334,6 @@ ENDING THE CALL:
                     {
                         if (m_greetingInFlight)
                         {
-                            // Server has interrupt_response=false during greeting, so it won't
-                            // auto-cancel TTS. We must mirror that on the client side — DO NOT
-                            // send StopAudio or response.cancel, or the greeting dies anyway.
                             m_logger.LogInformation("VAD started during greeting — IGNORING (greeting protection)");
                         }
                         else
@@ -380,7 +397,6 @@ ENDING THE CALL:
             m_farewellAudioBytes = 0;
             m_farewellDisconnectScheduled = false;
 
-            // Acknowledge the tool call.
             var toolOutput = new
             {
                 type = "conversation.item.create",
@@ -393,9 +409,6 @@ ENDING THE CALL:
             };
             await SendMessageAsync(JsonSerializer.Serialize(toolOutput));
 
-            // Force a fresh response with explicit per-response instructions for the farewell.
-            // Per-response instructions OVERRIDE the session prompt for this turn — most reliable
-            // way to make the model say a specific line under barge-in pressure.
             var farewellResponse = new
             {
                 type = "response.create",
@@ -411,7 +424,6 @@ ENDING THE CALL:
             await SendMessageAsync(JsonSerializer.Serialize(farewellResponse));
             m_logger.LogInformation("Farewell response triggered (hang_up response_id: {Id})", m_hangUpResponseId ?? "<unknown>");
 
-            // Safety net: force-disconnect after 12s if farewell never completes.
             _ = Task.Run(async () =>
             {
                 await Task.Delay(12000);
@@ -429,8 +441,6 @@ ENDING THE CALL:
         {
             if (m_pendingHangUp)
             {
-                // The hang_up tool-call response carries no audio; its response.done arrives ~1ms
-                // after we send response.create for the farewell. Ignore it; act on the NEXT one.
                 string? thisResponseId = null;
                 try
                 {
@@ -449,7 +459,6 @@ ENDING THE CALL:
                     return;
                 }
 
-                // Farewell response — wait for actual PSTN playback to finish, then disconnect.
                 m_farewellDisconnectScheduled = true;
                 const int SafetyTailMs = 500;
                 var bytes = m_farewellAudioBytes;
@@ -467,15 +476,11 @@ ENDING THE CALL:
 
             if (m_greetingInFlight && !m_greetingDelayScheduled)
             {
-                // Schedule the protection-off session.update for AFTER the greeting actually
-                // finishes playing on the phone. response.done fires when the SERVER finishes
-                // generating audio (sub-second), not when PSTN has played it.
                 m_greetingDelayScheduled = true;
                 const int SafetyTailMs = 300;
                 var bytes = m_greetingAudioBytesSent;
                 var playbackMs = (int)(bytes * 1000L / VoiceLiveBytesPerSecond) + SafetyTailMs;
-                m_logger.LogInformation(
-                    "Greeting response.done; holding protection {DelayMs}ms while {Bytes} bytes finish playing",
+                m_logger.LogInformation("Greeting response.done; holding protection {DelayMs}ms while {Bytes} bytes finish playing",
                     playbackMs, bytes);
                 _ = Task.Run(async () =>
                 {
@@ -483,14 +488,8 @@ ENDING THE CALL:
                     {
                         await Task.Delay(playbackMs);
                         m_greetingInFlight = false;
-
-                        // Discard ANY audio captured during the greeting — without this, what
-                        // the customer said while the greeting was playing is committed as a
-                        // user turn, and the AI replies to it the moment we re-enable normal VAD.
-                        await SendMessageAsync(JsonSerializer.Serialize(
-                            new { type = "input_audio_buffer.clear" }, s_compactJson));
+                        await SendMessageAsync(JsonSerializer.Serialize(new { type = "input_audio_buffer.clear" }, s_compactJson));
                         m_logger.LogInformation("Cleared input audio buffer (discarding mid-greeting speech)");
-
                         m_logger.LogInformation("Greeting playback estimated complete — re-enabling normal turn detection");
                         await UpdateSessionAsync();
                     }
