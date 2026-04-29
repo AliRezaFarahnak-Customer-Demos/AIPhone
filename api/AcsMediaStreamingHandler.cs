@@ -1,142 +1,111 @@
 using System.Net.WebSockets;
-using Azure.Communication.CallAutomation;
 using System.Text;
-using CallAutomation.AzureAI.VoiceLive;
+using Azure.Communication.CallAutomation;
 using Microsoft.Extensions.Logging;
 
-public class AcsMediaStreamingHandler
+namespace CallAutomation.AzureAI.VoiceLive
 {
-    private WebSocket m_webSocket;
-    private CancellationTokenSource m_cts;
-    private MemoryStream m_buffer;
-    private AzureVoiceLiveService? m_aiServiceHandler;
-    private IConfiguration m_configuration;
-    private readonly ILogger<AcsMediaStreamingHandler> m_logger;
-    private readonly ILoggerFactory m_loggerFactory;
-
-    // Constructor to inject AzureAIFoundryClient
-    public AcsMediaStreamingHandler(
-        WebSocket webSocket,
-        IConfiguration configuration,
-        ILogger<AcsMediaStreamingHandler> logger,
-        ILoggerFactory loggerFactory)
+    public class AcsMediaStreamingHandler
     {
-        m_webSocket = webSocket;
-        m_configuration = configuration;
-        m_buffer = new MemoryStream();
-        m_cts = new CancellationTokenSource();
-        m_logger = logger;
-        m_loggerFactory = loggerFactory;
+        private readonly WebSocket m_webSocket;
+        private readonly IConfiguration m_configuration;
+        private readonly ILogger<AcsMediaStreamingHandler> m_logger;
+        private readonly ILoggerFactory m_loggerFactory;
+        private AzureVoiceLiveService m_aiServiceHandler = null!;
+        private CancellationTokenSource m_cts = new();
 
-        m_logger.LogInformation("🔧 AcsMediaStreamingHandler initialized");
-    }
-
-    // Method to receive messages from WebSocket
-    public async Task ProcessWebSocketAsync()
-    {
-        if (m_webSocket == null)
+        public AcsMediaStreamingHandler(
+            WebSocket webSocket,
+            IConfiguration configuration,
+            ILogger<AcsMediaStreamingHandler> logger,
+            ILoggerFactory loggerFactory)
         {
-            m_logger.LogError("❌ WebSocket is null in ProcessWebSocketAsync");
-            return;
+            m_webSocket = webSocket;
+            m_configuration = configuration;
+            m_logger = logger;
+            m_loggerFactory = loggerFactory;
         }
 
-        // start forwarder to AI model
-        m_logger.LogInformation("🤖 Initializing Azure Voice Live Service");
-        var voiceLiveLogger = m_loggerFactory.CreateLogger<AzureVoiceLiveService>();
-        m_aiServiceHandler = new AzureVoiceLiveService(this, m_configuration, voiceLiveLogger);
-
-        try
+        public async Task ProcessWebSocketAsync()
         {
-            //m_aiServiceHandler.StartConversation();
-            await StartReceivingFromAcsMediaWebSocket();
-        }
-        catch (Exception ex)
-        {
-            m_logger.LogError(ex, "❌ Exception in ProcessWebSocketAsync");
-        }
-        finally
-        {
-            await m_aiServiceHandler.Close();
-            this.Close();
-        }
-    }
+            if (m_webSocket == null) return;
 
-    public async Task SendMessageAsync(string message)
-    {
-        if (m_webSocket?.State == WebSocketState.Open)
-        {
-            byte[] jsonBytes = Encoding.UTF8.GetBytes(message);
-
-            // Send the PCM audio chunk over WebSocket
-            await m_webSocket.SendAsync(new ArraySegment<byte>(jsonBytes), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
-        }
-    }
-
-    public async Task CloseWebSocketAsync(WebSocketReceiveResult result)
-    {
-        if (result.CloseStatus.HasValue)
-        {
-            await m_webSocket!.CloseAsync(result.CloseStatus.Value, result.CloseStatusDescription, CancellationToken.None);
-        }
-    }
-
-    public async Task CloseNormalWebSocketAsync()
-    {
-        await m_webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Stream completed", CancellationToken.None);
-    }
-
-    public void Close()
-    {
-        m_cts.Cancel();
-        m_cts.Dispose();
-        m_buffer.Dispose();
-    }
-
-    private async Task WriteToAzureFoundryAIServiceInputStream(string data)
-    {
-        if (m_aiServiceHandler == null)
-        {
-            m_logger.LogWarning("⚠️ AI service handler is null");
-            return;
-        }
-
-        var input = StreamingData.Parse(data);
-        if (input is AudioData audioData)
-        {
-            if (!audioData.IsSilent)
+            try
             {
-                using (var ms = new MemoryStream(audioData.Data.ToArray()))
+                m_aiServiceHandler = new AzureVoiceLiveService(
+                    this,
+                    m_configuration,
+                    m_loggerFactory.CreateLogger<AzureVoiceLiveService>());
+
+                // hang_up tool callback — terminate the bridge so ACS tears down the call.
+                m_aiServiceHandler.OnHangUp(async reason =>
                 {
-                    await m_aiServiceHandler.SendAudioToExternalAI(ms);
+                    m_logger.LogInformation("AI requested hang up: {Reason}", reason);
+                    m_cts.Cancel();
+                    if (m_webSocket.State == WebSocketState.Open)
+                    {
+                        await m_webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "AI hangup", CancellationToken.None);
+                    }
+                });
+
+                await m_aiServiceHandler.InitializeAsync();
+                await StartReceivingFromAcsMediaWebSocket();
+            }
+            catch (Exception ex)
+            {
+                m_logger.LogError(ex, "Error in ACS media streaming handler");
+            }
+            finally
+            {
+                if (m_aiServiceHandler != null)
+                {
+                    await m_aiServiceHandler.Close();
                 }
             }
         }
-    }
 
-    // receive messages from WebSocket
-    private async Task StartReceivingFromAcsMediaWebSocket()
-    {
-        if (m_webSocket == null)
+        public async Task SendMessageAsync(string message)
         {
-            return;
+            if (m_webSocket?.State != WebSocketState.Open) return;
+            var bytes = Encoding.UTF8.GetBytes(message);
+            await m_webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, endOfMessage: true, CancellationToken.None);
         }
-        try
-        {
-            while (m_webSocket.State == WebSocketState.Open || m_webSocket.State == WebSocketState.Closed)
-            {
-                byte[] receiveBuffer = new byte[2048];
-                WebSocketReceiveResult receiveResult = await m_webSocket.ReceiveAsync(new ArraySegment<byte>(receiveBuffer), m_cts.Token);
 
-                if (receiveResult.MessageType != WebSocketMessageType.Close)
+        private async Task WriteToAzureFoundryAIServiceInputStream(string data)
+        {
+            var input = StreamingData.Parse(data);
+            if (input is AudioData audioData && !audioData.IsSilent)
+            {
+                await m_aiServiceHandler.SendAudioToExternalAI(audioData.Data.ToArray());
+            }
+        }
+
+        private async Task StartReceivingFromAcsMediaWebSocket()
+        {
+            if (m_webSocket == null) return;
+            try
+            {
+                while (m_webSocket.State == WebSocketState.Open && !m_cts.IsCancellationRequested)
                 {
-                    string data = Encoding.UTF8.GetString(receiveBuffer).TrimEnd('\0');
+                    var buffer = new byte[2048];
+                    var receiveResult = await m_webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), m_cts.Token);
+                    if (receiveResult.MessageType == WebSocketMessageType.Close)
+                    {
+                        m_logger.LogInformation("ACS WebSocket closed by remote");
+                        break;
+                    }
+                    var data = Encoding.UTF8.GetString(buffer, 0, receiveResult.Count);
                     await WriteToAzureFoundryAIServiceInputStream(data);
                 }
             }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Exception -> {ex}");
+            catch (OperationCanceledException)
+            {
+                m_logger.LogInformation("ACS WebSocket receive cancelled");
+            }
+            catch (Exception ex)
+            {
+                m_logger.LogError(ex, "Exception while receiving from ACS WebSocket");
+            }
         }
     }
 }
