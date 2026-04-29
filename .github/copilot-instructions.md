@@ -50,3 +50,22 @@ Repo: https://github.com/AliRezaFarahnak-Customer-Demos/AIPhone
 - Program.cs: ✅ Optimized (answer first, log second, <50ms response)
 - Helper.cs: ✅ Caller ID + context validation working
 - AzureVoiceLiveService.cs: ✅ Nordic Bank assistant (Danish/English)
+
+## Reference Implementation
+
+**Source of truth**: `c:\repos\ContactCenterAgent\code\caller-agent\agent\` (CCA). AIPhone is a stripped clone — wire-payload identical for AI/audio behavior. Only intentional deltas:
+
+| Field               | AIPhone                                 | CCA                                 |
+| ------------------- | --------------------------------------- | ----------------------------------- |
+| `voice.name`        | `en-US-Andrew:DragonHDOmniLatestNeural` | per-call (Norlys default)           |
+| `voice.style`       | `shouting`                              | `friendly`                          |
+| `voice.locale`      | omitted (Omni multilingual auto-detect) | `da-DK` pinned                      |
+| `voice.temperature` | `0.9`                                   | `0.9`                               |
+| System prompt       | hardcoded Andrew shouting, opens "HEJ!" | per-call from admin-chat            |
+| Farewell text       | "SHOUT in caller's language"            | "Tak fordi du er kunde hos Norlys…" |
+| `phrase_list`       | empty (no domain vocab)                 | NorlysDanishPhrases                 |
+| Transcription model | `azure-speech` (same default as CCA)    | `azure-speech`                      |
+
+**Not ported** (CCA-only features, deliberately omitted): per-call prompt/language API, ConversationAnalysisService, SSE transcript/analysis channels, AppInsights `TelemetryClient` event tagging, outbound `/api/outboundCall` endpoint.
+
+**Always identical to CCA** (do not drift): VAD knobs (azure_semantic_vad / 0.3 / 300ms / 500ms), `interrupt_response=false` + `create_response=false` greeting gating, `azure_deep_noise_suppression`, `server_echo_cancellation`, pcm16 24kHz both ways, hang_up tool schema + farewell sequencing, 401 retry with `claims="{}"`, contextId WS query → `callConnections` map → `HangUpAsync(true)`.
